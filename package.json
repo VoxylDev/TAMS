@@ -1,0 +1,39 @@
+{
+    "name": "tams",
+    "private": true,
+    "type": "module",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/VoxylDev/TAMS"
+    },
+    "packageManager": "yarn@4.12.0",
+    "workspaces": [
+        "packages/*"
+    ],
+    "scripts": {
+        "packages": "FORCE_COLOR=true yarn workspaces foreach -Avpi -j 4 --no-private run",
+        "dev": "yarn packages dev",
+        "build": "yarn packages build",
+        "lint:script": "eslint --cache 'packages/**/src/**/*.ts'",
+        "lint:fix": "yarn lint:script --fix",
+        "lint": "yarn lint:script",
+        "format:check": "prettier --check 'packages/**/src/**/*.ts'",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.21.0",
+        "@types/node": "^22.13.0",
+        "esbuild": "^0.25.0",
+        "eslint": "^9.21.0",
+        "eslint-config-prettier": "^10.0.0",
+        "eslint-import-resolver-typescript": "^4.4.4",
+        "eslint-plugin-import-x": "^4.6.0",
+        "eslint-plugin-prettier": "^5.2.0",
+        "eslint-plugin-unicorn": "^57.0.0",
+        "prettier": "^3.5.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.8.0",
+        "typescript-eslint": "^8.24.0"
+    }
+}

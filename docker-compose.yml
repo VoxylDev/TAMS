@@ -1,0 +1,71 @@
+# TAMS — Full Stack Docker Compose
+#
+# Starts PostgreSQL, Redis, and the TAMS HTTP server.
+# Usage: docker compose up
+#
+# After the server is healthy, bootstrap your first user and token:
+#   curl -X POST http://localhost:3100/admin/users \
+#     -H "Content-Type: application/json" \
+#     -d '{"name": "admin"}'
+#
+#   curl -X POST http://localhost:3100/admin/tokens \
+#     -H "Content-Type: application/json" \
+#     -d '{"user_id": "<user-id-from-above>"}'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tams
+      POSTGRES_USER: tams
+      POSTGRES_PASSWORD: ${TAMS_DB_PASSWORD:-tams}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tams -d tams"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  tams:
+    build: .
+    ports:
+      - "3100:3100"
+    environment:
+      TAMS_DB_HOST: postgres
+      TAMS_DB_PORT: 5432
+      TAMS_DB_NAME: tams
+      TAMS_DB_USER: tams
+      TAMS_DB_PASSWORD: ${TAMS_DB_PASSWORD:-tams}
+      TAMS_REDIS_HOST: redis
+      TAMS_REDIS_PORT: 6379
+      TAMS_LLM_API_KEY: ${TAMS_LLM_API_KEY:-}
+      TAMS_LLM_BASE_URL: ${TAMS_LLM_BASE_URL:-}
+      TAMS_LLM_FAST_MODEL: ${TAMS_LLM_FAST_MODEL:-gpt-4o-mini}
+      TAMS_LLM_ABSTRACT_MODEL: ${TAMS_LLM_ABSTRACT_MODEL:-gpt-4o-mini}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:

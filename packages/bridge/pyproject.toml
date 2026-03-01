@@ -1,0 +1,44 @@
+[project]
+name = "tams-memory"
+version = "0.1.0"
+description = "MCP server for the TAMS memory system"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "TAMS Contributors" }]
+keywords = ["mcp", "memory", "ai", "agents", "tams"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastmcp>=2.12.5",
+    "pydantic>=2.10.6",
+    "pydantic-settings>=2.2.1",
+    "httpx>=0.28.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/VoxylDev/TAMS"
+Repository = "https://github.com/VoxylDev/TAMS"
+Issues = "https://github.com/VoxylDev/TAMS/issues"
+
+[project.scripts]
+tams-mcp = "tams_mcp.server:main"
+tams-mcp-http = "tams_mcp.server:main_http"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tams_mcp"]
