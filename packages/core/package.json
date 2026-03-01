@@ -1,0 +1,24 @@
+{
+    "name": "@tams/core",
+    "version": "0.1.0",
+    "type": "module",
+    "license": "MIT",
+    "exports": {
+        ".": "./src/index.ts",
+        "./*": "./src/*.ts"
+    },
+    "scripts": {
+        "dev": "tsx watch --preserve-symlinks --clear-screen=false ./src/main.ts",
+        "build": "tsc && tsx --preserve-symlinks ./build.ts",
+        "start": "node --enable-source-maps ./dist/main.js"
+    },
+    "dependencies": {
+        "@tams/common": "workspace:*",
+        "ioredis": "^5.4.0",
+        "openai": "^4.77.0",
+        "pg": "^8.13.0"
+    },
+    "devDependencies": {
+        "@types/pg": "^8.11.0"
+    }
+}

@@ -1,0 +1,20 @@
+{
+    "name": "@tams/mcp",
+    "version": "0.1.0",
+    "type": "module",
+    "license": "MIT",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "scripts": {
+        "dev": "tsx watch --preserve-symlinks --clear-screen=false ./src/main.ts",
+        "build": "tsc && tsx --preserve-symlinks ./build.ts",
+        "start": "node --enable-source-maps --env-file=../../.env ./dist/main.js"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.6.0",
+        "@tams/common": "workspace:*",
+        "@tams/core": "workspace:*",
+        "zod": "^3.24.0"
+    }
+}
