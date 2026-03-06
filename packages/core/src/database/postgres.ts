@@ -357,7 +357,7 @@ export default class Postgres {
         );
 
         const byTemporalResult = await this.pool.query<{ temporal: string; count: string }>(
-            'SELECT temporal, COUNT(*) as count FROM memory_nodes WHERE user_id = $1 GROUP BY temporal',
+            'SELECT temporal, COUNT(DISTINCT path) as count FROM memory_nodes WHERE user_id = $1 GROUP BY temporal',
             [userId]
         );
 
