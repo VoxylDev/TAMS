@@ -12,9 +12,9 @@
         "start": "node --enable-source-maps --env-file=../../.env ./dist/main.js"
     },
     "dependencies": {
-        "@hono/node-server": "^1.13.0",
+        "@hono/node-server": "^1.19.11",
         "@tams/common": "workspace:*",
         "@tams/core": "workspace:*",
-        "hono": "^4.7.0"
+        "hono": "^4.12.5"
     }
 }
