@@ -688,6 +688,11 @@ export default class TAMS {
                         `Background consolidation complete for ${job.path}: ` +
                             `${result.layersGenerated} layers, ${result.tokensUsed} tokens.`
                     );
+
+                    // Auto-enqueue temporal consolidation for parent nodes.
+                    // Walk up the tree (day → week → month → year) and enqueue
+                    // temporal jobs for each level, skipping any already queued.
+                    this.enqueueTemporalChain(job.userId, job.path);
                 } else if (job.type === 'temporal' && job.level) {
                     const result = await this.consolidator.consolidateTemporal(
                         job.userId,
@@ -725,6 +730,53 @@ export default class TAMS {
         }
 
         this.processing = false;
+    }
+
+    /**
+     * Enqueues temporal consolidation jobs for all ancestor nodes of a
+     * conversation path (day → week → month → year), skipping any paths
+     * that already have a temporal job in the queue.
+     *
+     * @param userId - The owning user's UUID.
+     * @param conversationPath - The ltree path of the completed conversation.
+     */
+    private enqueueTemporalChain(userId: string, conversationPath: string): void {
+        const levels: TemporalLevel[] = [
+            TemporalLevel.Day,
+            TemporalLevel.Week,
+            TemporalLevel.Month,
+            TemporalLevel.Year
+        ];
+
+        // Walk up the parent chain from conversation → day → week → month → year
+        let currentPath = getParentPath(conversationPath);
+        let levelIndex = 0;
+
+        while (currentPath && levelIndex < levels.length) {
+            const level = levels[levelIndex];
+
+            // Skip if a temporal job for this exact path is already queued
+            const alreadyQueued = this.queue.some(
+                (j) => j.type === 'temporal' && j.path === currentPath
+            );
+
+            if (!alreadyQueued) {
+                this.queue.push({
+                    type: 'temporal',
+                    path: currentPath,
+                    userId,
+                    level,
+                    enqueuedAt: new Date()
+                });
+
+                log.info(
+                    `Auto-queued ${level} temporal consolidation for ${currentPath}.`
+                );
+            }
+
+            currentPath = getParentPath(currentPath);
+            levelIndex++;
+        }
     }
 
     /**
