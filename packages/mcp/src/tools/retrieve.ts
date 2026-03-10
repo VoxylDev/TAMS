@@ -12,7 +12,7 @@ import type { AbstractionDepth } from '@tams/common';
  *
  * @param userId - The authenticated user's ID.
  * @param tams - The TAMS service instance.
- * @param temporalScope - Optional ltree path (e.g. "year.2026.month.02.day.28").
+ * @param temporalScope - Optional ltree path (e.g. "year.2026.month.02.week.04.day.28").
  * @param maxDepth - Maximum depth to load (0-6).
  * @param auto - If true, planner decides scope/depth from query.
  * @param query - The user's query text (used when auto=true).
@@ -38,7 +38,7 @@ export async function handleRetrieve(
     }
 
     const lines: string[] = [
-        `Retrieved from: ${result.resolvedPath} (source: ${result.source})`,
+        `Retrieved ${result.layers.length} layers from: ${result.resolvedPaths?.join(', ') ?? result.resolvedPath} (source: ${result.source})`,
         `Max depth loaded: D${result.maxDepthLoaded} (${DEPTH_META[result.maxDepthLoaded].name})`,
         '---'
     ];

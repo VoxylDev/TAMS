@@ -79,7 +79,7 @@ export async function startServer(): Promise<void> {
                 .string()
                 .optional()
                 .describe(
-                    'ltree path to retrieve from (e.g. "year.2026.month.02.day.28"). ' +
+                    'ltree path to retrieve from (e.g. "year.2026.month.02.week.04.day.28"). ' +
                         'Defaults to current day.'
                 ),
             max_depth: z

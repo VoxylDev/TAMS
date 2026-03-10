@@ -26,7 +26,11 @@ import type {
     PromptEntry
 } from '@tams/common';
 /**
- * A pending consolidation job in the background queue.
+ * A pending consolidation job, persisted in Redis.
+ *
+ * Conversation transcripts are NOT stored in the job — they are
+ * fetched from PostgreSQL (D6 layer) when the job is processed.
+ * This keeps queue entries small and avoids data duplication.
  */
 interface ConsolidationJob {
     /** What type of consolidation to run. */
@@ -38,14 +42,11 @@ interface ConsolidationJob {
     /** The user who owns this memory. */
     userId: string;
 
-    /** The raw transcript (only for conversation jobs). */
-    transcript?: string;
-
     /** The temporal level (for temporal jobs). */
     level?: TemporalLevel;
 
-    /** When the job was enqueued. */
-    enqueuedAt: Date;
+    /** When the job was enqueued (ISO string for serialization). */
+    enqueuedAt: string;
 }
 
 /**
@@ -146,16 +147,6 @@ export default class TAMS {
     /** Whether the system has been initialized. */
     private ready = false;
 
-    /**
-     * Background consolidation queue.
-     *
-     * Jobs are processed one at a time to avoid overwhelming the LLM API
-     * with parallel requests. Each job runs 6 sequential LLM calls, so
-     * a queue of 4 jobs still takes ~10 minutes with Sonnet, but the
-     * callers don't block waiting for it.
-     */
-    private queue: ConsolidationJob[] = [];
-
     /** Whether the queue processor is currently running. */
     private processing = false;
 
@@ -188,6 +179,19 @@ export default class TAMS {
 
         this.ready = true;
         log.info('TAMS initialized successfully.');
+
+        // Recover any jobs left in the processing hold list from a prior crash
+        const recovered = await this.cache.queueRecoverStale();
+
+        if (recovered > 0) log.info(`Recovered ${recovered} stale consolidation job(s).`);
+
+        // Resume processing if there are pending jobs in the queue
+        const pending = await this.cache.queueLength();
+
+        if (pending > 0) {
+            log.info(`Resuming ${pending} pending consolidation job(s).`);
+            this.processQueue();
+        }
     }
 
     /**
@@ -297,16 +301,17 @@ export default class TAMS {
         // Invalidate cached context so the next getContext() includes fresh STM data
         await this.cache.invalidate(userId, path);
 
-        // Enqueue the consolidation job for background processing
-        this.queue.push({
+        // Enqueue the consolidation job for background processing (Redis-persisted)
+        const job: ConsolidationJob = {
             type: 'conversation',
             path,
-            transcript,
             userId,
-            enqueuedAt: now
-        });
+            enqueuedAt: now.toISOString()
+        };
 
-        const queuePosition = this.queue.length;
+        await this.cache.queuePush(job as unknown as Record<string, unknown>);
+
+        const queuePosition = await this.cache.queueLength();
 
         log.info(`Queued consolidation for ${path} (position ${queuePosition}).`);
 
@@ -367,6 +372,7 @@ export default class TAMS {
 
         return {
             layers,
+            resolvedPaths: paths,
             resolvedPath: paths[0],
             maxDepthLoaded: maxDepth,
             source: request.auto ? 'planner' : 'database'
@@ -416,15 +422,17 @@ export default class TAMS {
 
         log.info(`Triggering ${level}-level consolidation at ${targetPath}`);
 
-        this.queue.push({
+        const job: ConsolidationJob = {
             type: 'temporal',
             path: targetPath,
             userId,
             level,
-            enqueuedAt: new Date()
-        });
+            enqueuedAt: new Date().toISOString()
+        };
 
-        const queuePosition = this.queue.length;
+        await this.cache.queuePush(job as unknown as Record<string, unknown>);
+
+        const queuePosition = await this.cache.queueLength();
 
         log.info(`Queued temporal consolidation for ${targetPath} (position ${queuePosition}).`);
 
@@ -468,21 +476,23 @@ export default class TAMS {
         if (transcripts.length === 0) {
             log.info('No conversation transcripts found for reconsolidation.');
 
+            const currentLen = await this.cache.queueLength();
+
             return {
                 conversationsFound: 0,
                 conversationJobsEnqueued: 0,
                 temporalJobsEnqueued: 0,
                 totalJobsEnqueued: 0,
-                queuePositionStart: this.queue.length,
-                queuePositionEnd: this.queue.length,
+                queuePositionStart: currentLen,
+                queuePositionEnd: currentLen,
                 temporalPaths: { day: [], week: [], month: [], year: [] }
             };
         }
 
         log.info(`Found ${transcripts.length} conversation transcripts to reconsolidate.`);
 
-        const queuePositionStart = this.queue.length + 1,
-            now = new Date();
+        const queuePositionStart = (await this.cache.queueLength()) + 1,
+            now = new Date().toISOString();
 
         // Phase 1: Enqueue conversation consolidation jobs.
 
@@ -492,13 +502,14 @@ export default class TAMS {
             yearPaths = new Set<string>();
 
         for (const transcript of transcripts) {
-            this.queue.push({
+            const job: ConsolidationJob = {
                 type: 'conversation',
                 path: transcript.path,
-                transcript: transcript.content,
                 userId,
                 enqueuedAt: now
-            });
+            };
+
+            await this.cache.queuePush(job as unknown as Record<string, unknown>);
 
             // Walk up the tree to collect all temporal parent paths.
             //
@@ -547,20 +558,21 @@ export default class TAMS {
             const sorted = [...paths].sort();
 
             for (const path of sorted) {
-                this.queue.push({
+                const job: ConsolidationJob = {
                     type: 'temporal',
                     path,
                     userId,
                     level,
                     enqueuedAt: now
-                });
+                };
 
+                await this.cache.queuePush(job as unknown as Record<string, unknown>);
                 temporalJobsEnqueued++;
             }
         }
 
         const totalJobsEnqueued = transcripts.length + temporalJobsEnqueued,
-            queuePositionEnd = this.queue.length;
+            queuePositionEnd = await this.cache.queueLength();
 
         log.info(
             `Reconsolidation queued: ${transcripts.length} conversation jobs, ` +
@@ -607,7 +619,8 @@ export default class TAMS {
             cacheStats = this.cache.getStats(),
             stmSize = await this.cache.stmSize(userId),
             promptSize = await this.cache.promptSize(userId),
-            stmConfig = this.cache.getSTMConfig();
+            stmConfig = this.cache.getSTMConfig(),
+            queueLen = await this.cache.queueLength();
 
         return {
             ready: true,
@@ -618,7 +631,7 @@ export default class TAMS {
             cache: cacheStats,
             consolidation: {
                 totalTokensUsed: this.consolidator.getTotalTokensUsed(),
-                queueLength: this.queue.length,
+                queueLength: queueLen,
                 processing: this.processing
             },
             stm: {
@@ -663,25 +676,45 @@ export default class TAMS {
      * `processQueue()` is called. If already processing, it's a no-op
      * (the loop will pick up the new job after the current one finishes).
      *
-     * Jobs are sequential to avoid overwhelming the LLM API with
-     * parallel requests. Each job runs 6 LLM calls, so processing
-     * 4 jobs takes ~10 minutes with Sonnet — but callers returned
-     * immediately when they enqueued.
+     * Jobs are persisted in Redis via a reliable queue pattern:
+     * each job is atomically moved to a processing hold list before
+     * execution, then removed on completion. If the server crashes
+     * mid-job, the held job is recovered on the next startup.
+     *
+     * Conversation transcripts are fetched from PostgreSQL (D6 layer)
+     * rather than stored in the queue, keeping entries small.
      */
     private async processQueue(): Promise<void> {
         if (this.processing) return;
 
         this.processing = true;
 
-        while (this.queue.length > 0) {
-            const job = this.queue.shift()!;
+        while ((await this.cache.queueLength()) > 0) {
+            const raw = await this.cache.queuePop();
+
+            if (!raw) break;
+
+            const job = raw as unknown as ConsolidationJob;
 
             try {
-                if (job.type === 'conversation' && job.transcript) {
+                if (job.type === 'conversation') {
+                    // Fetch the D6 transcript from PostgreSQL
+                    const node = await this.db.getNode(
+                        job.userId,
+                        job.path,
+                        AbstractionDepth.D6
+                    );
+
+                    if (!node?.content) {
+                        log.warn(`No D6 transcript found for ${job.path}, skipping.`);
+                        await this.cache.queueComplete();
+                        continue;
+                    }
+
                     const result = await this.consolidator.consolidateConversation(
                         job.userId,
                         job.path,
-                        job.transcript
+                        node.content
                     );
 
                     log.info(
@@ -690,14 +723,12 @@ export default class TAMS {
                     );
 
                     // Auto-enqueue temporal consolidation for parent nodes.
-                    // Walk up the tree (day → week → month → year) and enqueue
-                    // temporal jobs for each level, skipping any already queued.
-                    this.enqueueTemporalChain(job.userId, job.path);
+                    await this.enqueueTemporalChain(job.userId, job.path);
                 } else if (job.type === 'temporal' && job.level) {
                     const result = await this.consolidator.consolidateTemporal(
                         job.userId,
                         job.path,
-                        job.level
+                        job.level as TemporalLevel
                     );
 
                     log.info(
@@ -705,6 +736,9 @@ export default class TAMS {
                             `${result.layersGenerated} layers, ${result.tokensUsed} tokens.`
                     );
                 }
+
+                // Mark the job as complete (remove from processing hold list)
+                await this.cache.queueComplete();
 
                 // Invalidate cache after each job so reads get fresh data
                 await this.cache.invalidate(job.userId, job.path);
@@ -726,6 +760,9 @@ export default class TAMS {
                     `Consolidation failed for ${job.path}: ` +
                         `${error instanceof Error ? error.message : String(error)}`
                 );
+
+                // Still complete the job to avoid infinite retry loops
+                await this.cache.queueComplete();
             }
         }
 
@@ -740,7 +777,7 @@ export default class TAMS {
      * @param userId - The owning user's UUID.
      * @param conversationPath - The ltree path of the completed conversation.
      */
-    private enqueueTemporalChain(userId: string, conversationPath: string): void {
+    private async enqueueTemporalChain(userId: string, conversationPath: string): Promise<void> {
         const levels: TemporalLevel[] = [
             TemporalLevel.Day,
             TemporalLevel.Week,
@@ -748,30 +785,34 @@ export default class TAMS {
             TemporalLevel.Year
         ];
 
+        // Fetch current queue for deduplication
+        const queued = await this.cache.queueGetAll();
+
         // Walk up the parent chain from conversation → day → week → month → year
         let currentPath = getParentPath(conversationPath);
         let levelIndex = 0;
 
         while (currentPath && levelIndex < levels.length) {
             const level = levels[levelIndex];
+            const pathToCheck = currentPath;
 
             // Skip if a temporal job for this exact path is already queued
-            const alreadyQueued = this.queue.some(
-                (j) => j.type === 'temporal' && j.path === currentPath
+            const alreadyQueued = queued.some(
+                (j) => j.type === 'temporal' && j.path === pathToCheck
             );
 
             if (!alreadyQueued) {
-                this.queue.push({
+                const job: ConsolidationJob = {
                     type: 'temporal',
                     path: currentPath,
                     userId,
                     level,
-                    enqueuedAt: new Date()
-                });
+                    enqueuedAt: new Date().toISOString()
+                };
 
-                log.info(
-                    `Auto-queued ${level} temporal consolidation for ${currentPath}.`
-                );
+                await this.cache.queuePush(job as unknown as Record<string, unknown>);
+
+                log.info(`Auto-queued ${level} temporal consolidation for ${currentPath}.`);
             }
 
             currentPath = getParentPath(currentPath);

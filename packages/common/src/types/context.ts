@@ -84,6 +84,9 @@ export interface RetrievalResult {
     /** The layers of memory content returned, ordered from shallowest to deepest. */
     layers: ContextLayer[];
 
+    /** All temporal paths that were queried (may include multiple when auto-planned). */
+    resolvedPaths?: string[];
+
     /** The temporal path that was resolved (may differ from request if auto-planned). */
     resolvedPath: string;
 
