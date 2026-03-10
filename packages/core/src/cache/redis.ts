@@ -360,6 +360,87 @@ export default class RedisCache {
         await this.client.del(this.buildPromptKey(userId));
     }
 
+    // --- Persistent Consolidation Queue ---
+
+    /**
+     * Pushes a consolidation job onto the persistent queue.
+     *
+     * @param job - The serializable job object.
+     * @returns The new queue length.
+     */
+    public async queuePush(job: Record<string, unknown>): Promise<number> {
+        return this.client.rpush(this.buildQueueKey(), JSON.stringify(job));
+    }
+
+    /**
+     * Atomically pops the next job from the queue into a processing hold list.
+     *
+     * Uses LMOVE so the job is held in `tams:queue:processing` until
+     * {@link queueComplete} is called. If the server crashes mid-job,
+     * {@link queueRecoverStale} moves it back on the next startup.
+     *
+     * @returns The next job, or null if the queue is empty.
+     */
+    public async queuePop(): Promise<Record<string, unknown> | null> {
+        const raw = await this.client.lmove(
+            this.buildQueueKey(),
+            this.buildProcessingKey(),
+            'LEFT',
+            'RIGHT'
+        );
+
+        return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+    }
+
+    /**
+     * Marks the current job as complete by removing it from the
+     * processing hold list.
+     */
+    public async queueComplete(): Promise<void> {
+        await this.client.lpop(this.buildProcessingKey());
+    }
+
+    /**
+     * Recovers any jobs left in the processing hold list (from a prior crash)
+     * by moving them back to the front of the main queue.
+     *
+     * Call once during {@link TAMS.initialize}.
+     *
+     * @returns The number of stale jobs recovered.
+     */
+    public async queueRecoverStale(): Promise<number> {
+        let recovered = 0;
+
+        // Move all items from processing back to the front of the queue
+        while (true) {
+            const raw = await this.client.rpop(this.buildProcessingKey());
+
+            if (!raw) break;
+
+            await this.client.lpush(this.buildQueueKey(), raw);
+            recovered++;
+        }
+
+        return recovered;
+    }
+
+    /**
+     * Returns all jobs currently in the queue (without consuming them).
+     * Used for deduplication checks before enqueueing temporal jobs.
+     */
+    public async queueGetAll(): Promise<Record<string, unknown>[]> {
+        const members = await this.client.lrange(this.buildQueueKey(), 0, -1);
+
+        return members.map((m) => JSON.parse(m) as Record<string, unknown>);
+    }
+
+    /**
+     * Returns the number of jobs waiting in the queue.
+     */
+    public async queueLength(): Promise<number> {
+        return this.client.llen(this.buildQueueKey());
+    }
+
     /**
      * Gracefully closes the Redis connection.
      */
@@ -401,5 +482,20 @@ export default class RedisCache {
      */
     private buildPromptKey(userId: string): string {
         return `${this.prefix}:${userId}:stm:prompts`;
+    }
+
+    /**
+     * Builds the Redis key for the persistent consolidation queue.
+     */
+    private buildQueueKey(): string {
+        return `${this.prefix}:queue`;
+    }
+
+    /**
+     * Builds the Redis key for the processing hold list.
+     * Jobs sit here while being actively processed; recovered on crash.
+     */
+    private buildProcessingKey(): string {
+        return `${this.prefix}:queue:processing`;
     }
 }
