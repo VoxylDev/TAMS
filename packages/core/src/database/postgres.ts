@@ -301,6 +301,36 @@ export default class Postgres {
     }
 
     /**
+     * Searches D4 and D1 content using case-insensitive text matching.
+     *
+     * This is the fallback when D3 entity search returns no results.
+     * Searches the Detail layer (D4) first for richer context, then
+     * the Gist layer (D1) for broader topic coverage.
+     *
+     * @param userId - The owning user's UUID.
+     * @param query - The search string to match against content.
+     * @param limit - Maximum number of results.
+     * @returns Matching nodes from D4 and D1 layers, ordered by most recent first.
+     */
+    public async searchContentFallback(
+        userId: string,
+        query: string,
+        limit = 10
+    ): Promise<MemoryNode[]> {
+        const result = await this.pool.query<MemoryNodeRow>(
+            `SELECT * FROM memory_nodes
+             WHERE user_id = $1
+               AND depth IN (4, 1)
+               AND content ILIKE $2
+             ORDER BY depth DESC, updated_at DESC
+             LIMIT $3`,
+            [userId, `%${query}%`, limit]
+        );
+
+        return result.rows.map(rowToNode);
+    }
+
+    /**
      * Retrieves all D6 (raw transcript) conversation nodes for a user.
      *
      * Used by the reconsolidation pipeline to fetch existing conversation

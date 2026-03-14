@@ -390,10 +390,15 @@ export default class TAMS {
     public async search(userId: string, query: string, limit = 10): Promise<MemoryNode[]> {
         this.ensureReady();
 
-        // Search across all major D3 entity fields — topics, entities, and tools.
-        // Each field is a separate containment query because @> only matches
-        // within the same JSON structure (can't OR across fields in one @>).
-        return this.tree.searchEntitiesBroad(userId, query, limit);
+        // Primary: search D3 entity fields (entities, tools, topics).
+        const d3Results = await this.tree.searchEntitiesBroad(userId, query, limit);
+
+        if (d3Results.length > 0) return d3Results;
+
+        // Fallback: search D4/D1 content text when D3 extraction missed the entity.
+        log.info(`D3 search empty for "${query}", falling back to content search.`);
+
+        return this.tree.searchContentFallback(userId, query, limit);
     }
 
     /**

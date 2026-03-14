@@ -2,7 +2,8 @@ import type TAMS from '@tams/core/tams.js';
 
 /**
  * Handles the tams_search tool — searches entity/theme data
- * across the D3 layer of the memory tree.
+ * across the D3 layer of the memory tree, with fallback to
+ * content search on D4/D1 layers when D3 returns nothing.
  *
  * @param userId - The authenticated user's ID.
  * @param tams - The TAMS service instance.
@@ -19,14 +20,20 @@ export async function handleSearch(
     const results = await tams.search(userId, query, limit);
 
     if (results.length === 0) {
-        return `No matches found for "${query}".`;
+        return `No results found.`;
     }
 
-    const lines: string[] = [`Found ${results.length} match(es) for "${query}":`];
+    const isD3 = results[0].depth === 3,
+        source = isD3 ? 'entity match' : 'content fallback';
+
+    const lines: string[] = [`Found ${results.length} match(es) for "${query}" (${source}):`];
 
     for (const node of results) {
-        lines.push(`\n[${node.temporal} / ${node.path}]`);
-        lines.push(`Entities: ${JSON.stringify(node.entities)}`);
+        lines.push(`\n[${node.temporal} / ${node.path} / D${node.depth}]`);
+
+        if (isD3) {
+            lines.push(`Entities: ${JSON.stringify(node.entities)}`);
+        }
 
         if (node.content) lines.push(`Content: ${node.content.slice(0, 200)}...`);
     }

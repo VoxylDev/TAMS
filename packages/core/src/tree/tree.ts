@@ -219,6 +219,25 @@ export default class MemoryTree {
     }
 
     /**
+     * Fallback content search across D4 and D1 layers.
+     *
+     * Used when D3 entity search returns no results. Searches the
+     * content text directly rather than relying on extracted entities.
+     *
+     * @param userId - The owning user's UUID.
+     * @param query - The search string.
+     * @param limit - Maximum results.
+     * @returns Matching D4/D1 nodes.
+     */
+    public async searchContentFallback(
+        userId: string,
+        query: string,
+        limit = 10
+    ): Promise<MemoryNode[]> {
+        return this.db.searchContentFallback(userId, query, limit);
+    }
+
+    /**
      * Ensures all ancestor nodes exist for a given path.
      *
      * If a node is being inserted at "year.2026.month.02.week.04.day.28.conv.abc123",
