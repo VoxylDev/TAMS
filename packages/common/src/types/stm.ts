@@ -20,8 +20,12 @@ export interface DeviceInfo {
  * A single entry in the short-term memory (STM) buffer.
  *
  * Stored in Redis as a sorted set member (scored by storedAt timestamp).
- * Contains the truncated tail of a conversation transcript for immediate
+ * Contains a head+tail excerpt of a conversation transcript for immediate
  * carry-over between agent sessions without waiting for LLM consolidation.
+ *
+ * The head (first 40% of budget) captures the opening context / problem
+ * statement, while the tail (last 60%) captures the most recent work.
+ * If the full transcript fits within the character budget, it is stored whole.
  */
 export interface STMEntry {
     /** The ltree path where this conversation is stored in PostgreSQL. */
@@ -33,7 +37,7 @@ export interface STMEntry {
     /** Optional session identifier for provenance tracking. */
     sessionId?: string;
 
-    /** Truncated tail content (~2000 chars / ~500 tokens). */
+    /** Head+tail excerpt of the conversation (~2000 chars / ~500 tokens). */
     content: string;
 
     /** Estimated token count of the content field. */
@@ -59,8 +63,9 @@ export interface STMConfig {
     maxEntries: number;
 
     /**
-     * Maximum characters to keep from the tail of each conversation.
-     * Controls the per-entry token budget (~4 chars per token).
+     * Maximum characters to keep per conversation entry (head + tail combined).
+     * The budget is split: 40% for the head (opening context), 60% for the
+     * tail (recent work). Controls the per-entry token budget (~4 chars/token).
      * @default 2000
      */
     maxTailChars: number;
