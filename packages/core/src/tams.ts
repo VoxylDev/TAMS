@@ -5,8 +5,8 @@ import MemoryTree from './tree/tree.js';
 import RedisCache from './cache/redis.js';
 import Consolidator from './consolidation/consolidator.js';
 import RetrievalPlanner from './consolidation/planner.js';
-import OpenAI from 'openai';
 
+import OpenAI from 'openai';
 import {
     AbstractionDepth,
     TemporalLevel,
@@ -732,11 +732,7 @@ export default class TAMS {
             try {
                 if (job.type === 'conversation') {
                     // Fetch the D6 transcript from PostgreSQL
-                    const node = await this.db.getNode(
-                        job.userId,
-                        job.path,
-                        AbstractionDepth.D6
-                    );
+                    const node = await this.db.getNode(job.userId, job.path, AbstractionDepth.D6);
 
                     if (!node?.content) {
                         log.warn(`No D6 transcript found for ${job.path}, skipping.`);
