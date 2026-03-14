@@ -24,6 +24,7 @@ import type { TAMSUser } from '@tams/common';
 export interface AuthVariables {
     userId: string;
     userName: string;
+    isAdmin: boolean;
 }
 
 /**
@@ -64,6 +65,7 @@ export function createAuthMiddleware(validateToken: ValidateTokenFn) {
 
         c.set('userId', user.id);
         c.set('userName', user.name);
+        c.set('isAdmin', user.isAdmin);
 
         return next();
     };

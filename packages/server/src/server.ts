@@ -34,11 +34,29 @@ import { serve } from '@hono/node-server';
 import { TAMS, loadConfig } from '@tams/core';
 import { log } from '@tams/common';
 
+import type { Context as HonoContext } from 'hono';
 import type { TemporalLevel } from '@tams/common';
 import type { AuthVariables } from './middleware/auth.js';
 
 /** Hono app with typed auth variables available on context. */
 type AuthApp = Hono<{ Variables: AuthVariables }>;
+
+/**
+ * Checks whether the current user has admin privileges.
+ *
+ * Returns a 403 JSON response if the user is not an admin,
+ * or null if the check passes and the handler should proceed.
+ *
+ * @param c - The Hono request context.
+ * @returns A 403 response if denied, or null if authorized.
+ */
+function requireAdmin(c: HonoContext): Response | null {
+    if (!c.get('isAdmin')) {
+        return c.json({ error: 'Admin access required' }, 403);
+    }
+
+    return null;
+}
 
 /** Default port for the TAMS HTTP server. */
 const DEFAULT_PORT = 3100;
@@ -211,6 +229,9 @@ export async function startServer(): Promise<void> {
     // --- Admin: Users ---
 
     app.post('/admin/users', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const body = await c.req.json<{ name: string; email?: string }>();
 
         if (!body.name) return c.json({ error: 'Missing required field: name' }, 400);
@@ -221,6 +242,9 @@ export async function startServer(): Promise<void> {
     });
 
     app.get('/admin/users', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const users = await db.listUsers();
 
         return c.json({ users });
@@ -229,6 +253,9 @@ export async function startServer(): Promise<void> {
     // --- Admin: Tokens ---
 
     app.post('/admin/tokens', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const body = await c.req.json<{ user_id: string; label?: string }>();
 
         if (!body.user_id) return c.json({ error: 'Missing required field: user_id' }, 400);
@@ -239,6 +266,9 @@ export async function startServer(): Promise<void> {
     });
 
     app.get('/admin/tokens/:userId', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const targetUserId = c.req.param('userId'),
             tokens = await db.listTokens(targetUserId);
 
@@ -246,6 +276,9 @@ export async function startServer(): Promise<void> {
     });
 
     app.delete('/admin/tokens/:tokenId', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const tokenId = c.req.param('tokenId'),
             revoked = await db.revokeToken(tokenId);
 
@@ -257,6 +290,9 @@ export async function startServer(): Promise<void> {
     // --- Admin: Reconsolidate ---
 
     app.post('/admin/reconsolidate', async (c) => {
+        const denied = requireAdmin(c);
+        if (denied) return denied;
+
         const userId = c.get('userId'),
             body = (await c.req.json().catch(() => ({}))) as {
                 start_date?: string;

@@ -22,6 +22,9 @@ export interface TAMSUser {
     /** Optional email address. Unique if provided. */
     email: string | null;
 
+    /** Whether this user has admin privileges. */
+    isAdmin: boolean;
+
     /** When this user was registered. */
     createdAt: Date;
 }

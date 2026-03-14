@@ -420,7 +420,7 @@ def main_http():
     connections from mobile apps, web clients, or other networked agents.
     Default port is 3200 — set behind a reverse proxy for HTTPS in production.
     """
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=3200)
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=3200)
 
 
 if __name__ == "__main__":
