@@ -152,8 +152,12 @@ export default class Consolidator {
         //
         //   D6 ─→ D5  (compressed dialog, branch)
         //   D6 ─→ D4 ─→ D3 ─→ D2 ─→ D1 ─→ D0  (main chain)
+        //
+        // After D3 is generated, a validation pass checks entity completeness
+        // against the D4 content and merges any missing entries.
         let currentContent = transcript,
-            layersGenerated = 1; // D6 already stored
+            layersGenerated = 1, // D6 already stored
+            d4Content = ''; // Tracked for D3 entity validation
 
         const transitions: [AbstractionDepth, AbstractionDepth, boolean][] = [
             [AbstractionDepth.D6, AbstractionDepth.D5, true], // branch: don't feed D5 → D4
@@ -175,6 +179,9 @@ export default class Consolidator {
 
             // Only advance the main chain if this isn't a branch
             if (!isBranch) currentContent = result.content;
+
+            // Capture D4 content for the upcoming D3 validation pass
+            if (toDepth === AbstractionDepth.D4) d4Content = currentContent;
 
             tokensUsed += result.tokensUsed;
 
@@ -199,6 +206,36 @@ export default class Consolidator {
                 entities,
                 tokenCount
             });
+
+            // After storing D3, validate entity completeness against D4.
+            // A lightweight LLM call checks for missing entities and merges
+            // any gaps into the existing extraction before downstream layers
+            // consume a potentially incomplete D3.
+            if (toDepth === AbstractionDepth.D3 && Object.keys(entities).length > 0 && d4Content) {
+                const validation = await this.validateD3Entities(d4Content, entities);
+
+                tokensUsed += validation.tokensUsed;
+
+                // If validation found missing entities, re-store the augmented D3
+                if (validation.entities !== entities) {
+                    entities = validation.entities;
+
+                    const updatedContent = JSON.stringify(entities, null, 2);
+
+                    currentContent = updatedContent;
+
+                    await this.tree.store(userId, {
+                        path,
+                        temporal,
+                        depth: AbstractionDepth.D3,
+                        content: updatedContent,
+                        entities,
+                        tokenCount: Math.ceil(updatedContent.length / 4)
+                    });
+
+                    log.info(`D3 validation: augmented entities at ${path}.`);
+                }
+            }
 
             layersGenerated++;
         }
@@ -325,6 +362,94 @@ export default class Consolidator {
      */
     public getTotalTokensUsed(): number {
         return this.totalTokensUsed;
+    }
+
+    /**
+     * Validates D3 entity extraction against D4 content.
+     *
+     * Sends a lightweight LLM call to check if any entities, tools, or
+     * topics mentioned in D4 are missing from the D3 extraction. If gaps
+     * are found, returns a merged JSON with the missing entries added.
+     *
+     * The validation prompt asks the LLM to be conservative — only genuinely
+     * missing items are flagged, not synonyms or variants of existing entries.
+     *
+     * @param d4Content - The D4 (Detail) layer content to validate against.
+     * @param d3Json - The extracted D3 entities JSON object.
+     * @returns The validated (possibly augmented) D3 JSON, and tokens used.
+     */
+    private async validateD3Entities(
+        d4Content: string,
+        d3Json: Record<string, unknown>
+    ): Promise<{ entities: Record<string, unknown>; tokensUsed: number }> {
+        const validationPrompt = [
+            'You are a memory entity validator. Compare the extracted entities against the source material and find anything missing.',
+            '',
+            'SOURCE (Detail layer):',
+            d4Content,
+            '',
+            'EXTRACTED ENTITIES:',
+            JSON.stringify(d3Json, null, 2),
+            '',
+            'Check for:',
+            '1. Named entities (people, projects, services) mentioned in the source but missing from "entities"',
+            '2. Tools/technologies mentioned in the source but missing from "tools"',
+            '3. Topics discussed in the source but missing from "topics"',
+            '4. Decisions described in the source but missing from "decisions"',
+            '',
+            'If everything is complete, respond with exactly: {"complete": true}',
+            'If there are missing items, respond with ONLY the missing items in this format:',
+            '{',
+            '  "complete": false,',
+            '  "missing_entities": ["name1"],',
+            '  "missing_tools": ["tool1"],',
+            '  "missing_topics": ["topic1"],',
+            '  "missing_decisions": [{"decision": "what", "outcome": "result"}]',
+            '}',
+            '',
+            'Be thorough but conservative — only flag genuinely missing items, not synonyms or variants of existing entries.'
+        ].join('\n');
+
+        const result = await this.callLLM(
+            'You are a precise entity validation assistant. Respond only with JSON.',
+            validationPrompt,
+            2048
+        );
+
+        try {
+            const validation = JSON.parse(stripCodeFences(result.content));
+
+            // Nothing missing — return the original D3 as-is
+            if (validation.complete === true) {
+                return { entities: d3Json, tokensUsed: result.tokensUsed };
+            }
+
+            // Merge missing items into the existing D3 JSON
+            const merged = { ...d3Json };
+
+            const mergeArray = (key: string, missingKey: string): void => {
+                const existing = Array.isArray(merged[key]) ? (merged[key] as unknown[]) : [];
+                const missing = Array.isArray(validation[missingKey])
+                    ? (validation[missingKey] as unknown[])
+                    : [];
+
+                if (missing.length > 0) {
+                    merged[key] = [...existing, ...missing];
+                }
+            };
+
+            mergeArray('entities', 'missing_entities');
+            mergeArray('tools', 'missing_tools');
+            mergeArray('topics', 'missing_topics');
+            mergeArray('decisions', 'missing_decisions');
+
+            return { entities: merged, tokensUsed: result.tokensUsed };
+        } catch {
+            // If validation response is unparseable, keep the original D3
+            log.warn('D3 validation response was not valid JSON, keeping original extraction.');
+
+            return { entities: d3Json, tokensUsed: result.tokensUsed };
+        }
     }
 
     /**
