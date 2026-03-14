@@ -360,6 +360,45 @@ export default class RedisCache {
         await this.client.del(this.buildPromptKey(userId));
     }
 
+    // --- Generic Key-Value Storage ---
+
+    /**
+     * Retrieves a string value by key.
+     *
+     * Used by the consolidation scheduler to store last-run timestamps
+     * and other lightweight metadata that needs to survive restarts.
+     *
+     * @param key - The raw Redis key (prefix is NOT applied automatically).
+     * @returns The stored value, or null if the key does not exist.
+     */
+    public async getValue(key: string): Promise<string | null> {
+        return this.client.get(key);
+    }
+
+    /**
+     * Stores a string value at the given key, optionally with a TTL.
+     *
+     * @param key - The raw Redis key (prefix is NOT applied automatically).
+     * @param value - The string value to store.
+     * @param ttl - Optional time-to-live in seconds.
+     */
+    public async setValue(key: string, value: string, ttl?: number): Promise<void> {
+        if (ttl) {
+            await this.client.set(key, value, 'EX', ttl);
+        } else {
+            await this.client.set(key, value);
+        }
+    }
+
+    /**
+     * Returns the configured key prefix for building namespaced keys.
+     * Used by external components (e.g. the scheduler) that need to
+     * build their own keys within the TAMS namespace.
+     */
+    public getPrefix(): string {
+        return this.prefix;
+    }
+
     // --- Persistent Consolidation Queue ---
 
     /**

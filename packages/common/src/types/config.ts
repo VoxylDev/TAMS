@@ -79,6 +79,55 @@ export interface ConsolidationConfig {
 }
 
 /**
+ * Configuration for the automatic consolidation scheduler.
+ *
+ * The scheduler runs background timers that automatically trigger
+ * day/week/month/year consolidation at the appropriate temporal
+ * boundaries, keeping the always-on context fresh without manual
+ * intervention.
+ *
+ * Each level has its own check interval. At each tick, the scheduler
+ * iterates all registered users and triggers consolidation for any
+ * temporal scope that has unconsolidated child data since the last run.
+ */
+export interface SchedulerConfig {
+    /**
+     * Whether the scheduler is enabled.
+     * When false, no automatic consolidation occurs.
+     * @default true
+     */
+    enabled: boolean;
+
+    /**
+     * How often to check for day-level consolidation (milliseconds).
+     * Day consolidation merges conversation nodes into the current day.
+     * @default 1800000 (30 minutes)
+     */
+    dayIntervalMs: number;
+
+    /**
+     * How often to check for week-level consolidation (milliseconds).
+     * Week consolidation merges day nodes into the current week.
+     * @default 7200000 (2 hours)
+     */
+    weekIntervalMs: number;
+
+    /**
+     * How often to check for month-level consolidation (milliseconds).
+     * Month consolidation merges week nodes into the current month.
+     * @default 21600000 (6 hours)
+     */
+    monthIntervalMs: number;
+
+    /**
+     * How often to check for year-level consolidation (milliseconds).
+     * Year consolidation merges month nodes into the current year.
+     * @default 86400000 (24 hours)
+     */
+    yearIntervalMs: number;
+}
+
+/**
  * Top-level TAMS configuration combining all subsystem configs.
  */
 export interface TAMSConfig {
@@ -93,6 +142,9 @@ export interface TAMSConfig {
 
     /** Short-term memory buffer settings. Optional — defaults applied if omitted. */
     stm?: Partial<STMConfig>;
+
+    /** Automatic consolidation scheduler settings. Optional — defaults applied if omitted. */
+    scheduler?: Partial<SchedulerConfig>;
 
     /** Log level: 'debug' | 'info' | 'warn' | 'error'. */
     logLevel?: string;

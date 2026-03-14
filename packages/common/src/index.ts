@@ -10,7 +10,12 @@ export * from './enums/depth.js';
 export * from './enums/temporal.js';
 
 // Types
-export type { MemoryNode, CreateNodeParams, UpdateNodeParams } from './types/node.js';
+export type {
+    MemoryNode,
+    CreateNodeParams,
+    UpdateNodeParams,
+    EnrichedSearchResult
+} from './types/node.js';
 
 export type {
     ContextLayer,
@@ -23,6 +28,7 @@ export type {
     DatabaseConfig,
     RedisConfig,
     ConsolidationConfig,
+    SchedulerConfig,
     TAMSConfig
 } from './types/config.js';
 

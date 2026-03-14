@@ -5,6 +5,7 @@ import MemoryTree from './tree/tree.js';
 import RedisCache from './cache/redis.js';
 import Consolidator from './consolidation/consolidator.js';
 import RetrievalPlanner from './consolidation/planner.js';
+import ConsolidationScheduler from './consolidation/scheduler.js';
 
 import OpenAI from 'openai';
 import {
@@ -19,6 +20,7 @@ import type {
     TAMSConfig,
     MemoryContext,
     MemoryNode,
+    EnrichedSearchResult,
     RetrievalRequest,
     RetrievalResult,
     ContextLayer,
@@ -145,6 +147,9 @@ export default class TAMS {
     /** Retrieval planner (LLM-backed with regex fallback). */
     private planner: RetrievalPlanner;
 
+    /** Automatic consolidation scheduler for background temporal merging. */
+    private scheduler?: ConsolidationScheduler;
+
     /** Whether the system has been initialized. */
     private ready = false;
 
@@ -220,6 +225,16 @@ export default class TAMS {
             log.info(`Resuming ${pending} pending consolidation job(s).`);
             this.processQueue();
         }
+
+        // Start the automatic consolidation scheduler
+        this.scheduler = new ConsolidationScheduler(
+            this,
+            this.cache,
+            this.db,
+            this.config.scheduler
+        );
+
+        this.scheduler.start();
     }
 
     /**
@@ -299,23 +314,52 @@ export default class TAMS {
             tokenCount: estimatedTokens
         });
 
-        // Push to the short-term memory buffer for immediate carry-over
+        // Push to the short-term memory buffer for immediate carry-over.
+        //
+        // Head+tail capture strategy: the beginning of a conversation usually
+        // contains the problem statement or goal, while the end has the most
+        // recent progress. We split the character budget between both:
+        //   - Head: first 40% of maxChars (captures the opening context)
+        //   - Tail: last 60% of maxChars (captures recent work)
+        //
+        // If the transcript fits entirely within the budget, store it whole.
+
         const stmConfig = this.cache.getSTMConfig(),
-            tail = transcript.slice(-stmConfig.maxTailChars),
-            tailTokens = Math.ceil(tail.length / 4);
+            maxChars = stmConfig.maxTailChars;
+
+        let snippet: string;
+
+        if (transcript.length <= maxChars) {
+            // Transcript fits within the budget — keep it all
+            snippet = transcript;
+        } else {
+            // Split the budget between head and tail
+            const headBudget = Math.floor(maxChars * 0.4),
+                tailBudget = maxChars - headBudget,
+                omitted = transcript.length - headBudget - tailBudget;
+
+            const head = transcript.slice(0, headBudget),
+                tail = transcript.slice(-tailBudget);
+
+            snippet = `${head}\n--- ${omitted} chars omitted ---\n${tail}`;
+        }
+
+        const snippetTokens = Math.ceil(snippet.length / 4);
 
         const entry: STMEntry = {
             path,
             storedAt: now.getTime(),
             sessionId,
-            content: tail,
-            tokenCount: tailTokens,
+            content: snippet,
+            tokenCount: snippetTokens,
             device: clientDevice ?? this.getDeviceInfo()
         };
 
         const bufferSize = await this.cache.stmPush(userId, entry);
 
-        log.debug(`STM buffer: pushed entry (${tailTokens} tokens). Buffer size: ${bufferSize}.`);
+        log.debug(
+            `STM buffer: pushed entry (${snippetTokens} tokens). Buffer size: ${bufferSize}.`
+        );
 
         // Evict the oldest entry if the buffer exceeded capacity
         if (bufferSize > stmConfig.maxEntries) {
@@ -408,25 +452,78 @@ export default class TAMS {
     }
 
     /**
-     * Searches for entities across the D3 layer of the memory tree.
+     * Searches for entities across the D3 layer of the memory tree,
+     * enriching each match with sibling D1 (gist) and D2 (outline) layers.
+     *
+     * When D3 entity search finds matches, the raw entity JSON alone lacks
+     * narrative context. This method fetches the sibling D1 and D2 nodes
+     * from the same temporal path so the consuming agent understands what
+     * happened in that conversation without a separate retrieval call.
+     *
+     * Falls back to D4/D1 content search (unenriched) when D3 returns nothing.
      *
      * @param userId - The authenticated user's UUID.
      * @param query - The search query (matched against entity JSON).
      * @param limit - Maximum number of results.
-     * @returns Matching memory nodes with entity data.
+     * @returns Enriched results (D3 + sibling context) or plain fallback nodes.
      */
-    public async search(userId: string, query: string, limit = 10): Promise<MemoryNode[]> {
+    public async search(
+        userId: string,
+        query: string,
+        limit = 10
+    ): Promise<EnrichedSearchResult[] | MemoryNode[]> {
         this.ensureReady();
 
         // Primary: search D3 entity fields (entities, tools, topics).
         const d3Results = await this.tree.searchEntitiesBroad(userId, query, limit);
 
-        if (d3Results.length > 0) return d3Results;
+        if (d3Results.length > 0) {
+            return this.enrichD3Results(userId, d3Results);
+        }
 
         // Fallback: search D4/D1 content text when D3 extraction missed the entity.
         log.info(`D3 search empty for "${query}", falling back to content search.`);
 
         return this.tree.searchContentFallback(userId, query, limit);
+    }
+
+    /**
+     * Enriches D3 search results with sibling D1 (gist) and D2 (outline) layers.
+     *
+     * For each D3 node, fetches the full abstraction stack at the same temporal
+     * path and extracts the D1 and D2 content. This provides narrative context
+     * alongside the structured entity data.
+     *
+     * @param userId - The authenticated user's UUID.
+     * @param d3Nodes - The D3 nodes returned by entity search.
+     * @returns Enriched results pairing each D3 match with its sibling context.
+     */
+    private async enrichD3Results(
+        userId: string,
+        d3Nodes: MemoryNode[]
+    ): Promise<EnrichedSearchResult[]> {
+        const enriched: EnrichedSearchResult[] = [];
+
+        for (const d3Node of d3Nodes) {
+            // Fetch the sibling layer stack (D0-D2) for this path
+            const siblings = await this.tree.retrieve(userId, d3Node.path, AbstractionDepth.D2);
+
+            // Extract D1 (gist) and D2 (outline) content from the sibling stack
+            let gist: string | null = null;
+            let outline: string | null = null;
+
+            for (const sibling of siblings) {
+                if (sibling.depth === AbstractionDepth.D1 && sibling.content.trim()) {
+                    gist = sibling.content;
+                } else if (sibling.depth === AbstractionDepth.D2 && sibling.content.trim()) {
+                    outline = sibling.content;
+                }
+            }
+
+            enriched.push({ match: d3Node, gist, outline });
+        }
+
+        return enriched;
     }
 
     /**
@@ -694,6 +791,9 @@ export default class TAMS {
      */
     public async shutdown(): Promise<void> {
         log.info('Shutting down TAMS...');
+
+        // Stop the scheduler first to prevent new consolidation triggers
+        if (this.scheduler) this.scheduler.stop();
 
         if (this.cache) await this.cache.close();
         if (this.db) await this.db.close();
