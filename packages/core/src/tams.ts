@@ -5,6 +5,7 @@ import MemoryTree from './tree/tree.js';
 import RedisCache from './cache/redis.js';
 import Consolidator from './consolidation/consolidator.js';
 import RetrievalPlanner from './consolidation/planner.js';
+import OpenAI from 'openai';
 
 import {
     AbstractionDepth,
@@ -141,7 +142,7 @@ export default class TAMS {
     /** The consolidation pipeline for compressing memories. */
     private consolidator!: Consolidator;
 
-    /** Rule-based retrieval planner. */
+    /** Retrieval planner (LLM-backed with regex fallback). */
     private planner: RetrievalPlanner;
 
     /** Whether the system has been initialized. */
@@ -176,6 +177,33 @@ export default class TAMS {
 
         // Initialize consolidation pipeline
         this.consolidator = new Consolidator(this.tree, this.config.consolidation);
+
+        // Wire up the planner with an LLM client for smart retrieval
+        if (this.config.consolidation.apiKey) {
+            const openai = new OpenAI({
+                apiKey: this.config.consolidation.apiKey,
+                ...(this.config.consolidation.baseUrl && {
+                    baseURL: this.config.consolidation.baseUrl
+                })
+            });
+
+            const model = this.config.consolidation.fastModel ?? 'gpt-4o-mini';
+
+            this.planner = new RetrievalPlanner({
+                complete: async (system: string, user: string) => {
+                    const response = await openai.chat.completions.create({
+                        model,
+                        max_tokens: 512,
+                        messages: [
+                            { role: 'system', content: system },
+                            { role: 'user', content: user }
+                        ]
+                    });
+
+                    return response.choices[0]?.message?.content ?? '';
+                }
+            });
+        }
 
         this.ready = true;
         log.info('TAMS initialized successfully.');
@@ -338,7 +366,7 @@ export default class TAMS {
 
         if (request.auto && request.query) {
             // Let the planner decide
-            const plan = this.planner.plan(request.query);
+            const plan = await this.planner.plan(request.query);
 
             paths = plan.paths;
             maxDepth = plan.maxDepth;

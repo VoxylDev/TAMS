@@ -1,4 +1,10 @@
-import { AbstractionDepth, TemporalLevel, buildPathFromDate, getCurrentPaths } from '@tams/common';
+import {
+    AbstractionDepth,
+    TemporalLevel,
+    buildPathFromDate,
+    getCurrentPaths,
+    log
+} from '@tams/common';
 
 /**
  * The result of a retrieval planning decision.
@@ -15,12 +21,30 @@ export interface PlanResult {
 }
 
 /**
- * Rule-based retrieval planner for the prototype.
+ * Minimal interface for LLM calls used by the planner.
  *
- * Analyzes the user's message to determine what temporal scope
- * and abstraction depth is needed. In production this would be
- * replaced by a lightweight LLM call (Haiku-class), but for the
- * prototype, pattern matching is sufficient and zero-cost.
+ * Decouples the planner from any specific LLM provider — callers
+ * supply a thin adapter that maps to their SDK of choice.
+ */
+export interface PlannerLLMClient {
+    /** Sends a system+user message and returns the text response. */
+    complete(system: string, user: string): Promise<string>;
+}
+
+/**
+ * Retrieval planner with dual-mode query analysis.
+ *
+ * Supports two complementary strategies for determining temporal
+ * scope and abstraction depth:
+ *
+ * 1. **LLM mode** (default when a client is provided) — sends a
+ *    lightweight LLM call to analyze intent, temporal references,
+ *    and specificity. Handles ambiguous queries that regex patterns
+ *    miss.
+ *
+ * 2. **Rule mode** (regex fallback) — the original pattern-matching
+ *    approach. Zero-cost and deterministic, used when the LLM client
+ *    is not configured or when the LLM call fails.
  *
  * Maps to the depth selection table from the TAMS design doc:
  * - Casual greeting -> D0 only
@@ -33,13 +57,150 @@ export interface PlanResult {
  */
 export default class RetrievalPlanner {
     /**
+     * Creates a new retrieval planner.
+     *
+     * @param llm - Optional LLM client for smart planning. When
+     *              provided, the planner uses LLM-based analysis
+     *              with regex fallback. When omitted, only regex
+     *              rules are used.
+     */
+    public constructor(private llm?: PlannerLLMClient) {}
+
+    /**
      * Plans the retrieval strategy for a user message.
+     *
+     * Routes to the LLM planner when available, falling back to
+     * rule-based planning on any failure. This ensures retrieval
+     * always returns a valid plan, even if the LLM is down or
+     * returns unparseable output.
      *
      * @param message - The user's message text.
      * @param now - Reference time for temporal resolution.
      * @returns The retrieval plan with paths, depth, and reason.
      */
-    public plan(message: string, now: Date = new Date()): PlanResult {
+    public async plan(message: string, now: Date = new Date()): Promise<PlanResult> {
+        if (this.llm) {
+            try {
+                return await this.planWithLLM(message, now);
+            } catch (error) {
+                log.warn(`LLM planner failed, falling back to rules: ${error}`);
+            }
+        }
+
+        return this.planWithRules(message, now);
+    }
+
+    // ----------------------------------------------------------------
+    //  LLM-based planning
+    // ----------------------------------------------------------------
+
+    /**
+     * Analyzes the user's message with a lightweight LLM call to
+     * determine optimal retrieval scope and depth.
+     *
+     * The prompt gives the LLM full context about the temporal path
+     * format and depth levels, allowing it to handle nuanced queries
+     * like "what did I ask you to remember?" or "anything about auth
+     * from last Tuesday?" that regex patterns can't match.
+     *
+     * @param message - The user's message text.
+     * @param now - Reference time for temporal resolution.
+     * @returns The LLM-determined retrieval plan.
+     * @throws On parse failure, timeout, or any LLM error.
+     */
+    private async planWithLLM(message: string, now: Date): Promise<PlanResult> {
+        const system = this.buildLLMPrompt(now),
+            response = await this.llm!.complete(system, message);
+
+        // Strip markdown code fences if the LLM wrapped its JSON response
+        const cleaned = response
+            .replace(/```(?:json)?\s*/g, '')
+            .replace(/```\s*/g, '')
+            .trim();
+
+        // Parse and validate the structured response
+        const parsed = JSON.parse(cleaned) as {
+            paths?: unknown;
+            maxDepth?: unknown;
+            reason?: unknown;
+        };
+
+        if (!Array.isArray(parsed.paths) || parsed.paths.length === 0) {
+            throw new Error('LLM response missing valid "paths" array');
+        }
+
+        if (typeof parsed.maxDepth !== 'number' || parsed.maxDepth < 0 || parsed.maxDepth > 6) {
+            throw new Error(`LLM response has invalid "maxDepth": ${parsed.maxDepth}`);
+        }
+
+        return {
+            paths: parsed.paths as string[],
+            maxDepth: parsed.maxDepth as AbstractionDepth,
+            reason: typeof parsed.reason === 'string' ? parsed.reason : 'LLM-planned retrieval'
+        };
+    }
+
+    /**
+     * Builds the system prompt for the LLM planner.
+     *
+     * Provides the current timestamp, temporal path format, depth
+     * level definitions, and guidelines for scope/depth selection.
+     * Kept compact to minimize token usage on lightweight models.
+     *
+     * @param now - Reference time for the prompt.
+     * @returns The complete system prompt string.
+     */
+    private buildLLMPrompt(now: Date): string {
+        return `You are a retrieval planner for a hierarchical memory system.
+
+Current time: ${now.toISOString()}
+
+Given the user's message, decide:
+1. Which temporal scopes to query (paths)
+2. How deep to load (maxDepth)
+
+Temporal paths use this format: year.YYYY.month.MM.week.WW.day.DD
+- Week is week-of-month (1-5): Math.ceil(day / 7)
+- Always include the current month and year as context paths
+- Add specific day/week paths based on the query's temporal references
+
+Depth levels:
+- 0 (Theme): 1-sentence abstract essence
+- 1 (Gist): 2-3 sentence summary
+- 2 (Outline): Bullet-point topic map
+- 3 (Entities): Structured JSON with names, tools, decisions, topics
+- 4 (Detail): Full paragraphs with specific values preserved
+- 5 (Exchanges): Compressed dialog with speaker attribution
+- 6 (Raw): Original transcript
+
+Guidelines:
+- Default to D1 for general queries
+- Use D3-D4 when asking about specific facts, decisions, or entities
+- Use D5-D6 only for verbatim recall or decision tracing
+- When the query references "earlier today" or "recent", include today's day path
+- When the query is vague about time, include the current week's days
+
+Respond with ONLY valid JSON:
+{"paths": ["year.2026", "year.2026.month.03", ...], "maxDepth": 3, "reason": "brief explanation"}`;
+    }
+
+    // ----------------------------------------------------------------
+    //  Rule-based planning (regex fallback)
+    // ----------------------------------------------------------------
+
+    /**
+     * Plans the retrieval strategy using deterministic regex rules.
+     *
+     * This is the original planning logic — zero-cost and reliable,
+     * used as the fallback when the LLM planner is unavailable or
+     * fails. Matches temporal references and specificity signals in
+     * the user's message against predefined patterns.
+     *
+     * @param message - The user's message text.
+     * @param now - Reference time for temporal resolution.
+     * @returns The rule-determined retrieval plan.
+     */
+    private planWithRules(message: string, now: Date = new Date()): PlanResult {
         const lower = message.toLowerCase(),
             paths = this.resolveTemporalScope(lower, now),
             { depth, reason } = this.resolveDepth(lower);
