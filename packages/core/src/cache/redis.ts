@@ -246,21 +246,19 @@ export default class RedisCache {
     /**
      * Evicts and returns the oldest entry from the STM buffer.
      *
-     * Uses ZRANGE to get the lowest-scored (oldest) member,
-     * then removes it atomically.
+     * Uses ZPOPMIN to atomically remove and return the
+     * lowest-scored (oldest) member in a single round-trip.
      *
      * @param userId - The owning user's UUID.
      * @returns The evicted entry, or null if the buffer is empty.
      */
     public async stmEvictOldest(userId: string): Promise<STMEntry | null> {
         const key = this.buildSTMKey(userId),
-            oldest = await this.client.zrange(key, 0, 0);
+            result = await this.client.zpopmin(key);
 
-        if (oldest.length === 0) return null;
+        if (!result || result.length === 0) return null;
 
-        await this.client.zrem(key, oldest[0]);
-
-        return JSON.parse(oldest[0]) as STMEntry;
+        return JSON.parse(result[0]) as STMEntry;
     }
 
     /**
@@ -328,18 +326,19 @@ export default class RedisCache {
     /**
      * Evicts and returns the oldest entry from the prompts buffer.
      *
+     * Uses ZPOPMIN to atomically remove and return the
+     * lowest-scored (oldest) member in a single round-trip.
+     *
      * @param userId - The owning user's UUID.
      * @returns The evicted entry, or null if the buffer is empty.
      */
     public async promptEvictOldest(userId: string): Promise<PromptEntry | null> {
         const key = this.buildPromptKey(userId),
-            oldest = await this.client.zrange(key, 0, 0);
+            result = await this.client.zpopmin(key);
 
-        if (oldest.length === 0) return null;
+        if (!result || result.length === 0) return null;
 
-        await this.client.zrem(key, oldest[0]);
-
-        return JSON.parse(oldest[0]) as PromptEntry;
+        return JSON.parse(result[0]) as PromptEntry;
     }
 
     /**
@@ -409,6 +408,19 @@ export default class RedisCache {
      */
     public async queuePush(job: Record<string, unknown>): Promise<number> {
         return this.client.rpush(this.buildQueueKey(), JSON.stringify(job));
+    }
+
+    /**
+     * Pushes a consolidation job to the FRONT of the persistent queue.
+     *
+     * Used for retry logic: transient failures re-enqueue the job at
+     * the head so it's retried before any new jobs behind it.
+     *
+     * @param job - The serializable job object.
+     * @returns The new queue length.
+     */
+    public async queuePushFront(job: Record<string, unknown>): Promise<number> {
+        return this.client.lpush(this.buildQueueKey(), JSON.stringify(job));
     }
 
     /**

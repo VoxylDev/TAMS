@@ -50,7 +50,30 @@ interface ConsolidationJob {
 
     /** When the job was enqueued (ISO string for serialization). */
     enqueuedAt: string;
+
+    /**
+     * How many times this job has been retried after transient failures.
+     *
+     * Starts at 0 (or undefined) on first enqueue. Incremented each time
+     * a transient error causes the job to be re-enqueued at the front of
+     * the queue. After reaching {@link MAX_JOB_RETRIES}, the job is
+     * abandoned and the error is logged.
+     */
+    retryCount?: number;
 }
+
+/**
+ * Maximum number of times a consolidation job will be re-enqueued
+ * after transient LLM failures before being abandoned.
+ */
+const MAX_JOB_RETRIES = 3;
+
+/**
+ * Delay (in milliseconds) before continuing queue processing after
+ * re-enqueueing a failed job. Gives the upstream API a moment to
+ * recover before the retry is attempted.
+ */
+const RETRY_REQUEUE_DELAY_MS = 5000;
 
 /**
  * Status information for the TAMS system.
@@ -155,6 +178,9 @@ export default class TAMS {
 
     /** Whether the queue processor is currently running. */
     private processing = false;
+
+    /** Whether a graceful shutdown has been requested. */
+    private shuttingDown = false;
 
     public constructor(private config: TAMSConfig) {
         this.planner = new RetrievalPlanner();
@@ -788,12 +814,36 @@ export default class TAMS {
 
     /**
      * Gracefully shuts down all subsystems.
+     *
+     * If a consolidation job is currently in-flight (e.g. an LLM call
+     * that takes 10-60s), waits up to 30 seconds for it to finish
+     * before closing connections. Remaining queued jobs stay in Redis
+     * and are recovered on next startup via `queueRecoverStale`.
      */
     public async shutdown(): Promise<void> {
         log.info('Shutting down TAMS...');
 
+        // Signal the queue processor to stop accepting new jobs
+        this.shuttingDown = true;
+
         // Stop the scheduler first to prevent new consolidation triggers
         if (this.scheduler) this.scheduler.stop();
+
+        // Wait for any in-flight consolidation job to finish
+        if (this.processing) {
+            log.info('Waiting for in-flight consolidation job to finish...');
+
+            const drained = await this.waitForQueueDrain(30_000);
+
+            if (drained) {
+                log.info('In-flight consolidation job completed.');
+            } else {
+                log.warn(
+                    'Timed out waiting for in-flight consolidation job (30s). ' +
+                        'Abandoning — job will be recovered on next startup.'
+                );
+            }
+        }
 
         if (this.cache) await this.cache.close();
         if (this.db) await this.db.close();
@@ -823,6 +873,14 @@ export default class TAMS {
         this.processing = true;
 
         while ((await this.cache.queueLength()) > 0) {
+            // If shutdown was requested, stop accepting new jobs from the queue.
+            // The current job (if any) has already finished — remaining jobs
+            // stay in Redis and will be recovered on next startup.
+            if (this.shuttingDown) {
+                log.info('Shutdown requested — stopping queue processor after current job.');
+                break;
+            }
+
             const raw = await this.cache.queuePop();
 
             if (!raw) break;
@@ -885,17 +943,72 @@ export default class TAMS {
                     this.cache.invalidate(job.userId, yearPath)
                 ]);
             } catch (error) {
-                log.error(
-                    `Consolidation failed for ${job.path}: ` +
-                        `${error instanceof Error ? error.message : String(error)}`
-                );
+                const retryCount = job.retryCount ?? 0,
+                    isTransient = this.isTransientError(error),
+                    canRetry = isTransient && retryCount < MAX_JOB_RETRIES;
 
-                // Still complete the job to avoid infinite retry loops
-                await this.cache.queueComplete();
+                if (canRetry) {
+                    // Transient failure with retries remaining — re-enqueue
+                    // at the front of the queue so it's retried next.
+                    log.warn(
+                        `Transient failure for ${job.path} (attempt ${retryCount + 1}/${MAX_JOB_RETRIES}), ` +
+                            `re-enqueueing: ${error instanceof Error ? error.message : String(error)}`
+                    );
+
+                    await this.cache.queueComplete();
+
+                    const retryJob: ConsolidationJob = {
+                        ...job,
+                        retryCount: retryCount + 1
+                    };
+
+                    await this.cache.queuePushFront(
+                        retryJob as unknown as Record<string, unknown>
+                    );
+
+                    // Brief pause before retrying to let the upstream API recover
+                    await new Promise((resolve) => setTimeout(resolve, RETRY_REQUEUE_DELAY_MS));
+                } else {
+                    // Non-transient error or retries exhausted — abandon the job
+                    if (isTransient) {
+                        log.error(
+                            `Consolidation failed for ${job.path} after ${MAX_JOB_RETRIES} attempts: ` +
+                                `${error instanceof Error ? error.message : String(error)}`
+                        );
+                    } else {
+                        log.error(
+                            `Consolidation failed for ${job.path} (non-transient): ` +
+                                `${error instanceof Error ? error.message : String(error)}`
+                        );
+                    }
+
+                    await this.cache.queueComplete();
+                }
             }
         }
 
         this.processing = false;
+    }
+
+    /**
+     * Waits for the queue processor to finish its current in-flight job.
+     *
+     * Polls `this.processing` at 500ms intervals until either the job
+     * completes or the timeout is reached. Does NOT drain the entire
+     * queue — only the currently executing job. Remaining queued jobs
+     * stay in Redis for recovery on next startup.
+     *
+     * @param timeoutMs - Maximum time to wait in milliseconds.
+     * @returns `true` if the queue drained before the timeout, `false` if timed out.
+     */
+    private async waitForQueueDrain(timeoutMs: number): Promise<boolean> {
+        const start = Date.now();
+
+        while (this.processing && Date.now() - start < timeoutMs) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+
+        return !this.processing;
     }
 
     /**
@@ -1066,6 +1179,34 @@ export default class TAMS {
             hostname: os.hostname(),
             platform: os.platform()
         };
+    }
+
+    /**
+     * Checks whether an error is transient and worth retrying.
+     *
+     * Transient errors include:
+     * - HTTP 429 (rate limit)
+     * - HTTP 5xx (server errors)
+     * - Network failures (ECONNRESET, ETIMEDOUT, socket hang up, fetch failed)
+     *
+     * All other errors (especially 4xx client errors) are considered
+     * permanent and should NOT be retried.
+     *
+     * @param error - The error to classify.
+     * @returns Whether the error is transient.
+     */
+    private isTransientError(error: unknown): boolean {
+        // Check for HTTP status codes (SDK attaches .status)
+        const status = (error as { status?: number }).status;
+
+        if (status === 429) return true;
+        if (status !== undefined && status >= 500) return true;
+
+        // Check for network-level failures in the error message
+        const message = error instanceof Error ? error.message : String(error),
+            networkPatterns = ['ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'fetch failed'];
+
+        return networkPatterns.some((pattern) => message.includes(pattern));
     }
 
     /**

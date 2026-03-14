@@ -18,6 +18,16 @@ import type { AbstractionDepth } from '@tams/common';
 const { Pool } = pg;
 
 /**
+ * Escapes SQL LIKE pattern special characters in a search string.
+ *
+ * The `%` and `_` characters have special meaning in LIKE patterns.
+ * Backslash-escaping them ensures they are treated as literals.
+ */
+function escapeLikePattern(query: string): string {
+    return query.replace(/[%_\\]/g, '\\$&');
+}
+
+/**
  * PostgreSQL connection manager for the TAMS memory system.
  *
  * Handles connection pooling, schema initialization, and provides
@@ -284,7 +294,7 @@ export default class Postgres {
         query: string,
         limit = 10
     ): Promise<MemoryNode[]> {
-        const pattern = `%${query}%`;
+        const pattern = `%${escapeLikePattern(query)}%`;
 
         const result = await this.pool.query<MemoryNodeRow>(
             `SELECT * FROM memory_nodes
@@ -292,17 +302,17 @@ export default class Postgres {
                  EXISTS (
                      SELECT 1 FROM jsonb_array_elements_text(
                          COALESCE(entities->'entities', '[]'::jsonb)
-                     ) elem WHERE elem ILIKE $2
+                     ) elem WHERE elem ILIKE $2 ESCAPE '\\'
                  )
                  OR EXISTS (
                      SELECT 1 FROM jsonb_array_elements_text(
                          COALESCE(entities->'tools', '[]'::jsonb)
-                     ) elem WHERE elem ILIKE $2
+                     ) elem WHERE elem ILIKE $2 ESCAPE '\\'
                  )
                  OR EXISTS (
                      SELECT 1 FROM jsonb_array_elements_text(
                          COALESCE(entities->'topics', '[]'::jsonb)
-                     ) elem WHERE elem ILIKE $2
+                     ) elem WHERE elem ILIKE $2 ESCAPE '\\'
                  )
              )
              ORDER BY updated_at DESC
@@ -334,10 +344,10 @@ export default class Postgres {
             `SELECT * FROM memory_nodes
              WHERE user_id = $1
                AND depth IN (4, 1)
-               AND content ILIKE $2
+               AND content ILIKE $2 ESCAPE '\\'
              ORDER BY depth DESC, updated_at DESC
              LIMIT $3`,
-            [userId, `%${query}%`, limit]
+            [userId, `%${escapeLikePattern(query)}%`, limit]
         );
 
         return result.rows.map(rowToNode);
@@ -388,28 +398,44 @@ export default class Postgres {
     /**
      * Returns aggregate statistics about the memory tree for a specific user.
      *
+     * Uses a single CTE query to fetch both aggregates in one database
+     * round-trip instead of two separate queries.
+     *
      * @param userId - The user's UUID.
      */
     public async getStats(userId: string): Promise<{
         total: number;
         byTemporal: Record<string, number>;
     }> {
-        const totalResult = await this.pool.query<{ count: string }>(
-            'SELECT COUNT(*) as count FROM memory_nodes WHERE user_id = $1',
+        const result = await this.pool.query<{
+            node_count: string;
+            by_temporal: { temporal: string; count: string }[] | null;
+        }>(
+            `WITH
+                node_total AS (
+                    SELECT COUNT(*) AS count FROM memory_nodes WHERE user_id = $1
+                ),
+                node_by_temporal AS (
+                    SELECT temporal, COUNT(DISTINCT path) AS count
+                    FROM memory_nodes WHERE user_id = $1
+                    GROUP BY temporal
+                )
+            SELECT
+                (SELECT count FROM node_total) AS node_count,
+                (SELECT json_agg(json_build_object('temporal', temporal, 'count', count))
+                    FROM node_by_temporal) AS by_temporal`,
             [userId]
         );
 
-        const byTemporalResult = await this.pool.query<{ temporal: string; count: string }>(
-            'SELECT temporal, COUNT(DISTINCT path) as count FROM memory_nodes WHERE user_id = $1 GROUP BY temporal',
-            [userId]
-        );
+        const row = result.rows[0],
+            byTemporal: Record<string, number> = {};
 
-        const byTemporal: Record<string, number> = {};
-
-        for (const row of byTemporalResult.rows) byTemporal[row.temporal] = Number(row.count);
+        if (row.by_temporal) {
+            for (const entry of row.by_temporal) byTemporal[entry.temporal] = Number(entry.count);
+        }
 
         return {
-            total: Number(totalResult.rows[0].count),
+            total: Number(row.node_count),
             byTemporal
         };
     }
@@ -562,7 +588,8 @@ export default class Postgres {
 
         const migrations: [number, string, string][] = [
             [1, '001-initial', MIGRATION_001],
-            [2, '002-auth', MIGRATION_002]
+            [2, '002-auth', MIGRATION_002],
+            [3, '003-admin-roles', MIGRATION_003]
         ];
 
         for (const [version, name, sql] of migrations) {
@@ -587,6 +614,7 @@ interface TAMSUserRow {
     user_id: string;
     name: string;
     email: string | null;
+    is_admin: boolean;
     created_at: Date;
 }
 
@@ -598,6 +626,7 @@ function rowToUser(row: TAMSUserRow): TAMSUser {
         id: row.id,
         name: row.name,
         email: row.email,
+        isAdmin: row.is_admin,
         createdAt: row.created_at
     };
 }
@@ -676,7 +705,7 @@ CREATE EXTENSION IF NOT EXISTS ltree;
 CREATE TABLE IF NOT EXISTS memory_nodes (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     path            ltree NOT NULL,
-    temporal        TEXT NOT NULL CHECK (temporal IN ('year', 'month', 'day', 'hour')),
+    temporal        TEXT NOT NULL CHECK (temporal IN ('year', 'month', 'week', 'day', 'conversation')),
     depth           SMALLINT NOT NULL CHECK (depth BETWEEN 0 AND 6),
     parent_id       UUID REFERENCES memory_nodes(id) ON DELETE SET NULL,
     content         TEXT NOT NULL DEFAULT '',
@@ -754,5 +783,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_path_depth ON memory_nodes (user_id, 
 -- Version record
 INSERT INTO schema_migrations (version, name)
 VALUES (2, '002-auth')
+ON CONFLICT (version) DO NOTHING;
+`;
+
+/**
+ * Admin roles migration — adds privilege separation to users.
+ *
+ * Adds an `is_admin` boolean column to `tams_users` (defaults to false).
+ * Non-admin users are blocked from /admin/* endpoints by the server
+ * middleware. Grant admin to specific users via SQL after deployment.
+ */
+const MIGRATION_003 = `
+-- Add admin flag to users (defaults to regular user)
+ALTER TABLE tams_users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
+
+-- Version record
+INSERT INTO schema_migrations (version, name)
+VALUES (3, '003-admin-roles')
 ON CONFLICT (version) DO NOTHING;
 `;

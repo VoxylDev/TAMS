@@ -140,16 +140,8 @@ export default class Consolidator {
 
         log.info(`Consolidating conversation at ${path} (~${estimatedTokens} tokens)...`);
 
-        // Store D6 (raw transcript)
-        await this.tree.store(userId, {
-            path,
-            temporal,
-            depth: AbstractionDepth.D6,
-            content: transcript,
-            tokenCount: estimatedTokens
-        });
-
         // Run the compression pipeline.
+        // D6 (raw transcript) is already stored by the caller (storeConversation).
         //
         // D4 is generated directly from D6 (raw transcript) to avoid
         // hallucination from cascading lossy compression. D3 onwards
@@ -182,7 +174,7 @@ export default class Consolidator {
                 isBranch || fromDepth === AbstractionDepth.D6 ? transcript : currentContent;
 
             const prompt = buildConsolidationPrompt(fromDepth, toDepth),
-                result = await this.callLLM(prompt, input);
+                result = await this.callLLMWithRetry(prompt, input);
 
             // Only advance the main chain if this isn't a branch
             if (!isBranch) currentContent = result.content;
@@ -320,7 +312,7 @@ export default class Consolidator {
                 const prompt = buildMergePrompt(depth, contents.length),
                     input = contents.map((c, i) => `--- Entry ${i + 1} ---\n${c}`).join('\n\n'),
                     maxTokens = depth === AbstractionDepth.D3 ? 16384 : 4096,
-                    result = await this.callLLM(prompt, input, maxTokens);
+                    result = await this.callLLMWithRetry(prompt, input, maxTokens);
 
                 mergedContent = result.content;
                 tokensUsed += result.tokensUsed;
@@ -417,7 +409,7 @@ export default class Consolidator {
             'Be thorough but conservative — only flag genuinely missing items, not synonyms or variants of existing entries.'
         ].join('\n');
 
-        const result = await this.callLLM(
+        const result = await this.callLLMWithRetry(
             'You are a precise entity validation assistant. Respond only with JSON.',
             validationPrompt,
             2048
@@ -457,6 +449,87 @@ export default class Consolidator {
 
             return { entities: d3Json, tokensUsed: result.tokensUsed };
         }
+    }
+
+    /**
+     * Wraps {@link callLLM} with exponential backoff retry logic.
+     *
+     * Only retries on transient errors: rate limits (429), server errors
+     * (5xx), and network/timeout failures. Client errors (4xx except 429)
+     * are thrown immediately since they indicate a real problem.
+     *
+     * Backoff schedule: 2s, 8s, 32s (2^attempt * 1000ms base).
+     * After 3 failed attempts the original error is re-thrown.
+     *
+     * @param systemPrompt - The system prompt defining the consolidation task.
+     * @param content - The input content to consolidate.
+     * @param maxTokens - Maximum tokens in the response.
+     * @returns The generated content and token usage.
+     */
+    private async callLLMWithRetry(
+        systemPrompt: string,
+        content: string,
+        maxTokens = 4096
+    ): Promise<{ content: string; tokensUsed: number }> {
+        const MAX_ATTEMPTS = 3,
+            BASE_DELAY_MS = 1000;
+
+        let lastError: unknown;
+
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            try {
+                return await this.callLLM(systemPrompt, content, maxTokens);
+            } catch (error) {
+                lastError = error;
+
+                // Only retry on transient errors
+                if (!this.isTransientError(error)) throw error;
+
+                // Don't sleep after the final failed attempt
+                if (attempt < MAX_ATTEMPTS - 1) {
+                    const delay = Math.pow(2, attempt + 1) * BASE_DELAY_MS;
+
+                    log.warn(
+                        `LLM call failed (attempt ${attempt + 1}/${MAX_ATTEMPTS}), ` +
+                            `retrying in ${delay}ms: ` +
+                            `${error instanceof Error ? error.message : String(error)}`
+                    );
+
+                    await new Promise((resolve) => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+        // All attempts exhausted — throw the last error
+        throw lastError;
+    }
+
+    /**
+     * Checks whether an error is transient and worth retrying.
+     *
+     * Transient errors include:
+     * - HTTP 429 (rate limit)
+     * - HTTP 5xx (server errors)
+     * - Network failures (ECONNRESET, ETIMEDOUT, socket hang up, fetch failed)
+     *
+     * All other errors (especially 4xx client errors) are considered
+     * permanent and should NOT be retried.
+     *
+     * @param error - The error to classify.
+     * @returns Whether the error is transient.
+     */
+    private isTransientError(error: unknown): boolean {
+        // Check for HTTP status codes (OpenAI SDK attaches .status)
+        const status = (error as { status?: number }).status;
+
+        if (status === 429) return true;
+        if (status !== undefined && status >= 500) return true;
+
+        // Check for network-level failures in the error message
+        const message = error instanceof Error ? error.message : String(error),
+            networkPatterns = ['ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'fetch failed'];
+
+        return networkPatterns.some((pattern) => message.includes(pattern));
     }
 
     /**
