@@ -89,9 +89,18 @@ export default class MemoryTree {
     /**
      * Builds the always-on memory context block.
      *
-     * Assembles D0 layers from each temporal level (year, month, week, day)
-     * plus D1 for the current day. This is the ~200-400 token block
-     * injected into every prompt for baseline personalization.
+     * Assembles layers from each temporal level with increasing detail
+     * as the scope narrows toward the present:
+     *
+     * - **Year**: D0 (theme) only
+     * - **Month**: D0 (theme) only
+     * - **Week**: D0 (theme) + D1 (gist)
+     * - **Day**: D0 (theme) + D1 (gist) + D2 (outline)
+     *
+     * This produces a ~200-500 token block injected into every prompt
+     * for baseline personalization. The graduated depth gives agents
+     * thin awareness of the broader timeframe while preserving richer
+     * detail for recent activity.
      *
      * @param userId - The owning user's UUID.
      * @param now - Reference time for "current" resolution. Defaults to now.
@@ -101,33 +110,42 @@ export default class MemoryTree {
         const paths = getCurrentPaths(now),
             allPaths = Object.values(paths) as string[];
 
-        // Fetch D0 for all temporal levels + D1 for current day
-        const nodes = await this.db.getContextLayers(userId, allPaths, AbstractionDepth.D1);
+        // Fetch up to D2 — we filter per-level below
+        const nodes = await this.db.getContextLayers(userId, allPaths, AbstractionDepth.D2);
 
         const layers: ContextLayer[] = [];
 
+        /**
+         * Maximum depth to include per temporal level:
+         *   Year  → D0 only (theme)
+         *   Month → D0 only (theme)
+         *   Week  → D0 + D1 (theme + gist)
+         *   Day   → D0 + D1 + D2 (theme + gist + outline)
+         */
+        const maxDepthByLevel: Record<TemporalLevel, AbstractionDepth> = {
+            [TemporalLevel.Year]: AbstractionDepth.D0,
+            [TemporalLevel.Month]: AbstractionDepth.D0,
+            [TemporalLevel.Week]: AbstractionDepth.D1,
+            [TemporalLevel.Day]: AbstractionDepth.D2,
+            [TemporalLevel.Conversation]: AbstractionDepth.D0
+        };
+
         // Build layers from broadest (year) to narrowest (day)
         for (const [level, path] of Object.entries(paths)) {
-            const temporal = level as TemporalLevel;
+            const temporal = level as TemporalLevel,
+                levelMaxDepth = maxDepthByLevel[temporal] ?? AbstractionDepth.D0;
 
             for (const node of nodes) {
                 if (node.path !== path) continue;
+                if (node.depth > levelMaxDepth) continue;
 
-                // Include D0 for all levels, D1 only for current day
-                const includeD1 = temporal === TemporalLevel.Day;
-
-                if (
-                    node.depth === AbstractionDepth.D0 ||
-                    (includeD1 && node.depth === AbstractionDepth.D1)
-                ) {
-                    if (node.content.trim()) {
-                        layers.push({
-                            temporal,
-                            depth: node.depth,
-                            path: node.path,
-                            content: node.content
-                        });
-                    }
+                if (node.content.trim()) {
+                    layers.push({
+                        temporal,
+                        depth: node.depth,
+                        path: node.path,
+                        content: node.content
+                    });
                 }
             }
         }
