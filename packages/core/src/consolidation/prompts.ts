@@ -87,9 +87,10 @@ const LAYER_PROMPTS: Partial<Record<AbstractionDepth, string>> = {
 - Organize by topic. Each distinct topic gets its own paragraph.
 - Preserve ALL specific values: numbers, port numbers, file paths, version strings, names, URLs, dollar amounts, percentages, sizes, durations, and configuration details.
 - If the source says "128kbps for SFX and 192kbps for music", the output MUST contain "128kbps" and "192kbps". Exact figures are load-bearing.
-- Preserve trade-offs and alternatives that were EXPLICITLY discussed. Do not infer reasoning that is not stated.
-- Do not elaborate, expand, or add context beyond what is present in the source. Extract, do not generate.
-- When in doubt about whether a detail was stated, omit it rather than risk fabrication.`,
+- Preserve trade-offs and alternatives that were discussed.
+- When reasoning is obvious from context (e.g. "use Redis for caching" clearly implies latency requirements), capture that causal link even if not explicitly spelled out.
+- Do not elaborate beyond what the source supports, but do connect dots that a competent reader would infer.
+- When in doubt about whether a detail was stated or implied, err toward including it with conservative framing rather than omitting entirely.`,
 
     [AbstractionDepth.D3]: `Specific instructions for the Entities layer:
 - Extract all named entities: people, tools, technologies, projects, concepts.

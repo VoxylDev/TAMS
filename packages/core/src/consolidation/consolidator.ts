@@ -28,8 +28,14 @@ function stripCodeFences(text: string): string {
     return match ? match[1] : text;
 }
 
-/** Minimum token count to consider a conversation worth full consolidation. */
-const DEFAULT_LOW_SIGNAL_THRESHOLD = 50;
+/**
+ * Minimum token count to consider a conversation worth full consolidation.
+ *
+ * Set to 30 tokens (~120 chars) to capture brief but valuable interactions
+ * like "remember X" requests or quick factual answers. Previously 50, which
+ * caused some meaningful short exchanges to be skipped.
+ */
+const DEFAULT_LOW_SIGNAL_THRESHOLD = 30;
 
 /**
  * Result of a consolidation operation, tracking what was generated.
@@ -145,13 +151,15 @@ export default class Consolidator {
 
         // Run the compression pipeline.
         //
-        // D5 and D4 are both generated directly from D6 (raw transcript).
-        // D5 compresses dialog; D4 extracts detailed facts. Both need the
-        // full source material to avoid hallucination from cascading lossy
-        // compression. D3 onwards compresses from D4.
+        // D4 is generated directly from D6 (raw transcript) to avoid
+        // hallucination from cascading lossy compression. D3 onwards
+        // compresses from D4.
         //
-        //   D6 ─→ D5  (compressed dialog, branch)
         //   D6 ─→ D4 ─→ D3 ─→ D2 ─→ D1 ─→ D0  (main chain)
+        //
+        // D5 (Exchanges) is skipped by default — it costs a full LLM call
+        // but was never read in practice. The raw D6 transcript serves the
+        // same purpose when explicit decision tracing is requested.
         //
         // After D3 is generated, a validation pass checks entity completeness
         // against the D4 content and merges any missing entries.
@@ -160,8 +168,7 @@ export default class Consolidator {
             d4Content = ''; // Tracked for D3 entity validation
 
         const transitions: [AbstractionDepth, AbstractionDepth, boolean][] = [
-            [AbstractionDepth.D6, AbstractionDepth.D5, true], // branch: don't feed D5 → D4
-            [AbstractionDepth.D6, AbstractionDepth.D4, false], // reset to D6 for D4
+            [AbstractionDepth.D6, AbstractionDepth.D4, false], // D4 from full raw source
             [AbstractionDepth.D4, AbstractionDepth.D3, false],
             [AbstractionDepth.D3, AbstractionDepth.D2, false],
             [AbstractionDepth.D2, AbstractionDepth.D1, false],
