@@ -6,6 +6,9 @@ Connects to the TAMS HTTP server for all memory operations.
 """
 
 import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastmcp import FastMCP
@@ -13,6 +16,8 @@ from pydantic import Field
 
 from tams_mcp.client import TAMSClient
 from tams_mcp.config import settings
+
+logger = logging.getLogger(__name__)
 from tams_mcp.formatters import (
     format_consolidate,
     format_context,
@@ -114,14 +119,100 @@ Include entities (repos, files, tools, services) and problems solved.
 """
 
 
+# Global HTTP client — initialized before the server so that the
+# lifespan hook can use it for auto-store on shutdown.
+client = TAMSClient()
+
+
+# ============================================================================
+# Session Tracking — auto-store on disconnect
+# ============================================================================
+# Tracks whether the agent explicitly called tams_store during the session
+# and accumulates prompt text locally. If the session ends without a store,
+# the lifespan shutdown hook auto-stores the buffered prompts as a safety net.
+
+
+class SessionTracker:
+    """Tracks session state for auto-store on disconnect.
+
+    Records whether tams_store was called and accumulates the raw prompt
+    text from each tams_prompt_store call. On shutdown, if no explicit
+    store occurred and prompts exist, the lifespan triggers an auto-store.
+    """
+
+    def __init__(self) -> None:
+        self.store_called: bool = False
+        self.prompts: list[str] = []
+
+    def record_store(self) -> None:
+        """Mark that tams_store was explicitly called this session."""
+        self.store_called = True
+
+    def record_prompt(self, content: str) -> None:
+        """Buffer a user prompt for potential auto-store."""
+        self.prompts.append(content)
+
+    def should_auto_store(self) -> bool:
+        """Check whether an auto-store is needed.
+
+        Returns True only if there are buffered prompts and tams_store
+        was never called during this session.
+        """
+        return not self.store_called and len(self.prompts) > 0
+
+    def build_auto_store_content(self) -> str:
+        """Build the content string for an auto-store.
+
+        Prefixes the joined prompts with a marker so that consolidation
+        can distinguish auto-stored prompt dumps from full transcripts.
+        """
+        header = "[Auto-stored: agent session ended without explicit store]"
+        body = "\n".join(self.prompts)
+        return f"{header}\n\n{body}"
+
+
+# Module-level tracker instance — shared across all tool calls in this process.
+session_tracker = SessionTracker()
+
+
+@asynccontextmanager
+async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:
+    """FastMCP lifespan hook for auto-store on shutdown.
+
+    Startup: no-op (yields immediately).
+    Shutdown: if the agent never called tams_store and there are buffered
+    prompts, auto-stores them as a best-effort safety net.
+    """
+    yield {}
+
+    # --- Shutdown phase ---
+
+    if not session_tracker.should_auto_store():
+        return
+
+    content = session_tracker.build_auto_store_content()
+    prompt_count = len(session_tracker.prompts)
+
+    logger.info(
+        "Auto-storing %d buffered prompts (no explicit tams_store was called)",
+        prompt_count,
+    )
+
+    try:
+        result = await client.store(content)
+        path = result.get("path", "unknown")
+        logger.info("Auto-store succeeded: %s (%d prompts)", path, prompt_count)
+    except Exception:
+        logger.exception("Auto-store failed (best-effort, not fatal)")
+
+
 # Initialize the MCP server
 mcp = FastMCP(
     name="TAMS Memory",
     instructions=build_instructions(settings.store_frequency),
+    lifespan=_lifespan,
 )
 
-# Global HTTP client
-client = TAMSClient()
 
 
 # ============================================================================
@@ -158,6 +249,7 @@ async def tams_store(
     abstraction layers (D6 raw -> D0 theme). Call at session end to persist memory.
     """
     try:
+        session_tracker.record_store()
         result = await client.store(content, session_id)
         return format_store(result)
     except Exception as e:
@@ -177,6 +269,7 @@ async def tams_prompt_store(
     and "what did we last talk about?" queries can reference the user's actual words.
     """
     try:
+        session_tracker.record_prompt(content)
         result = await client.store_prompt(content, session_id)
         return format_prompt_store(result)
     except Exception as e:
