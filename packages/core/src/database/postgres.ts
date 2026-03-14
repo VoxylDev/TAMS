@@ -264,13 +264,18 @@ export default class Postgres {
     }
 
     /**
-     * Searches D3 nodes across multiple entity fields using OR logic.
+     * Searches D3 nodes across multiple entity fields using case-insensitive
+     * substring matching with OR logic.
      *
-     * Checks if the query string appears in entities, tools, or topics arrays.
-     * Uses JSONB containment (@>) on each field separately, then unions the results.
+     * Extracts array elements from the `entities`, `tools`, and `topics` JSONB
+     * fields and matches them against the query using ILIKE for case-insensitive
+     * comparison. Missing keys are safely handled with COALESCE to empty arrays.
+     *
+     * This replaces the previous JSONB containment (@>) approach which was
+     * case-sensitive — searching "kaetram" would not find "Kaetram".
      *
      * @param userId - The owning user's UUID.
-     * @param query - The search string to match against entity fields.
+     * @param query - The search string to match against entity fields (case-insensitive).
      * @param limit - Maximum number of results.
      * @returns Matching D3 nodes, ordered by most recent first.
      */
@@ -279,22 +284,30 @@ export default class Postgres {
         query: string,
         limit = 10
     ): Promise<MemoryNode[]> {
+        const pattern = `%${query}%`;
+
         const result = await this.pool.query<MemoryNodeRow>(
             `SELECT * FROM memory_nodes
              WHERE user_id = $1 AND depth = 3 AND (
-                 entities @> $2::jsonb
-                 OR entities @> $3::jsonb
-                 OR entities @> $4::jsonb
+                 EXISTS (
+                     SELECT 1 FROM jsonb_array_elements_text(
+                         COALESCE(entities->'entities', '[]'::jsonb)
+                     ) elem WHERE elem ILIKE $2
+                 )
+                 OR EXISTS (
+                     SELECT 1 FROM jsonb_array_elements_text(
+                         COALESCE(entities->'tools', '[]'::jsonb)
+                     ) elem WHERE elem ILIKE $2
+                 )
+                 OR EXISTS (
+                     SELECT 1 FROM jsonb_array_elements_text(
+                         COALESCE(entities->'topics', '[]'::jsonb)
+                     ) elem WHERE elem ILIKE $2
+                 )
              )
              ORDER BY updated_at DESC
-             LIMIT $5`,
-            [
-                userId,
-                JSON.stringify({ entities: [query] }),
-                JSON.stringify({ tools: [query] }),
-                JSON.stringify({ topics: [query] }),
-                limit
-            ]
+             LIMIT $3`,
+            [userId, pattern, limit]
         );
 
         return result.rows.map(rowToNode);
