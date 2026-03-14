@@ -71,6 +71,26 @@ export interface CreateNodeParams {
 }
 
 /**
+ * A D3 entity search result enriched with sibling D1 (gist) and D2 (outline)
+ * layers from the same temporal path.
+ *
+ * When search finds a D3 entity match, the raw entity JSON alone lacks narrative
+ * context about what actually happened. The sibling D1 and D2 layers provide
+ * that context — a 2-3 sentence summary and a bullet-point outline — so the
+ * consuming agent can understand the match without a separate retrieval call.
+ */
+export interface EnrichedSearchResult {
+    /** The D3 node that matched the search query. */
+    match: MemoryNode;
+
+    /** The D1 (gist) sibling from the same path, if it exists. */
+    gist: string | null;
+
+    /** The D2 (outline) sibling from the same path, if it exists. */
+    outline: string | null;
+}
+
+/**
  * Parameters for updating an existing memory node.
  * Only the fields that should change need to be provided.
  */
